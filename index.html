@@ -1,0 +1,604 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Air Strings</title>
+<style>
+  :root {
+    --bg: #05070c;
+    --fg: #e8f1ff;
+    --muted: #8a97ad;
+    --accent: #9fffd0;
+    --panel: rgba(12, 16, 26, .78);
+    --line: rgba(255, 255, 255, .14);
+  }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; overflow: hidden; }
+  canvas { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; touch-action: none; }
+  video { display: none; }
+
+  #intro { position: fixed; inset: 0; display: grid; place-items: center; padding: 16px;
+    background: radial-gradient(ellipse at center, rgba(20,40,60,.55), rgba(0,0,0,.85)); z-index: 5; }
+  .card { max-width: 460px; width: 100%; background: var(--panel); border: 1px solid var(--line);
+    border-radius: 18px; padding: 26px 24px; backdrop-filter: blur(10px); box-sizing: border-box; }
+  .card h1 { margin: 0 0 4px; font-size: 28px; letter-spacing: .5px; }
+  .card p.sub { margin: 0 0 18px; color: var(--muted); }
+  .card ol { margin: 0 0 20px; padding-left: 20px; line-height: 1.55; }
+  .card li { margin-bottom: 6px; }
+  .card b { color: var(--accent); font-weight: 600; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  button, select { font: inherit; color: var(--fg); background: rgba(255,255,255,.08);
+    border: 1px solid var(--line); border-radius: 10px; padding: 8px 14px; cursor: pointer; }
+  button:hover, select:hover { background: rgba(255,255,255,.14); }
+  button.primary { background: var(--accent); color: #04120b; border-color: transparent; font-weight: 600; padding: 10px 18px; }
+  button.link { background: none; border: none; color: var(--muted); text-decoration: underline; padding: 8px 4px; }
+  select option { background: #111722; }
+
+  #bar { position: fixed; left: 50%; bottom: 16px; transform: translateX(-50%); display: none;
+    gap: 8px; padding: 8px; background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+    backdrop-filter: blur(8px); z-index: 3; flex-wrap: wrap; justify-content: center; max-width: calc(100vw - 32px); box-sizing: border-box; }
+  #bar button, #bar select { padding: 6px 12px; font-size: 14px; }
+  #status { position: fixed; top: 14px; left: 16px; font-size: 13px; color: var(--muted); z-index: 3;
+    background: var(--panel); padding: 6px 10px; border-radius: 8px; border: 1px solid var(--line); display: none; }
+</style>
+</head>
+<body>
+<video id="video" playsinline muted></video>
+<canvas id="c"></canvas>
+
+<div id="status">Starting…</div>
+
+<div id="bar">
+  <button id="undo" title="Backspace">Undo</button>
+  <button id="clear" title="C">Clear</button>
+  <select id="scale" title="Tuning">
+    <option value="pentatonic">Pentatonic</option>
+    <option value="major">Major</option>
+    <option value="minor">Minor</option>
+    <option value="chromatic">Chromatic</option>
+    <option value="free">Free (no snapping)</option>
+  </select>
+  <button id="toggleVideo" title="V">Hide camera</button>
+  <button id="toggleHands" title="H">Hide hands</button>
+</div>
+
+<div id="intro">
+  <div class="card">
+    <h1>Air Strings</h1>
+    <p class="sub">Draw strings of light in midair and play them with your hands.</p>
+    <ol>
+      <li><b>Pinch</b> thumb + index to set the first point, move, and <b>release</b> to set the second point. A string appears between them.</li>
+      <li>Or pinch with <b>both hands</b> to stretch a string between them.</li>
+      <li><b>Swipe</b> your index fingertip through a string to pluck it.</li>
+      <li><b>Pinch on a string</b> to grab it, pull it, and let go to twang it.</li>
+    </ol>
+    <p class="sub">Shorter strings play higher notes. A mouse also works: drag to draw, hover across a string to pluck it, drag a string to pull it.</p>
+    <div class="row">
+      <button class="primary" id="start">Start camera</button>
+      <button class="link" id="mouseOnly">Mouse only</button>
+    </div>
+  </div>
+</div>
+
+<script type="module">
+import { FilesetResolver, HandLandmarker } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+// ---------- Canvas ----------
+const canvas = document.getElementById('c');
+const g = canvas.getContext('2d');
+const video = document.getElementById('video');
+const statusEl = document.getElementById('status');
+let W = 0, H = 0, DPR = 1;
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = innerWidth; H = innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  g.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+addEventListener('resize', resize); resize();
+
+// ---------- Utils ----------
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+const lerpPt = (a, b, k) => ({ x: a.x + (b.x - a.x) * k, y: a.y + (b.y - a.y) * k });
+const smooth = (prev, next, k) => prev ? lerpPt(prev, next, k) : { ...next };
+function segInter(p1, p2, p3, p4) { // returns param along p3->p4, or null
+  const rx = p2.x - p1.x, ry = p2.y - p1.y, sx = p4.x - p3.x, sy = p4.y - p3.y;
+  const d = rx * sy - ry * sx;
+  if (Math.abs(d) < 1e-9) return null;
+  const qx = p3.x - p1.x, qy = p3.y - p1.y;
+  const u = (qx * sy - qy * sx) / d, v = (qx * ry - qy * rx) / d;
+  return (u >= 0 && u <= 1 && v >= 0 && v <= 1) ? v : null;
+}
+
+// ---------- Music ----------
+const SCALES = {
+  pentatonic: [0, 3, 5, 7, 10],
+  major: [0, 2, 4, 5, 7, 9, 11],
+  minor: [0, 2, 3, 5, 7, 8, 10],
+  chromatic: [0,1,2,3,4,5,6,7,8,9,10,11],
+};
+const ROOT = 9; // A
+let scaleName = 'pentatonic';
+const NOTE_NAMES = ['C','C♯','D','D♯','E','F','F♯','G','G♯','A','A♯','B'];
+function rawMidi(len) {
+  const r = len / Math.hypot(W, H);
+  const f = 110 * (0.5 / Math.max(r, 0.02));
+  return clamp(69 + 12 * Math.log2(f / 440), 36, 96);
+}
+function quantize(m) {
+  if (scaleName === 'free') return m;
+  const sc = SCALES[scaleName];
+  let best = m, bd = 1e9;
+  for (let o = 1; o <= 8; o++) for (const s of sc) {
+    const n = 12 * o + ROOT + s, d = Math.abs(n - m);
+    if (d < bd) { bd = d; best = n; }
+  }
+  return best;
+}
+const midiToFreq = m => 440 * Math.pow(2, (m - 69) / 12);
+const noteName = m => { const r = Math.round(m); return NOTE_NAMES[((r % 12) + 12) % 12] + (Math.floor(r / 12) - 1); };
+const stringMidi = s => quantize(rawMidi(s.len));
+const hueFor = m => 150 + ((m - 36) / 60) * 170;
+
+// ---------- Audio (Karplus-Strong plucked string) ----------
+let actx = null, master = null;
+function initAudio() {
+  if (actx) { actx.resume(); return; }
+  actx = new (window.AudioContext || window.webkitAudioContext)();
+  const comp = actx.createDynamicsCompressor();
+  comp.threshold.value = -16; comp.ratio.value = 4; comp.attack.value = 0.003; comp.release.value = 0.2;
+  master = actx.createGain(); master.gain.value = 0.85;
+  const conv = actx.createConvolver(); conv.buffer = makeImpulse(2.6);
+  const wet = actx.createGain(); wet.gain.value = 0.32;
+  master.connect(comp); master.connect(conv); conv.connect(wet); wet.connect(comp);
+  comp.connect(actx.destination);
+}
+function makeImpulse(sec) {
+  const sr = actx.sampleRate, n = (sr * sec) | 0, b = actx.createBuffer(2, n, sr);
+  for (let c = 0; c < 2; c++) {
+    const d = b.getChannelData(c);
+    for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / n, 3.4);
+  }
+  return b;
+}
+function playPluck(freq, amp, pan, pickPos) {
+  if (!actx) return;
+  const sr = actx.sampleRate;
+  const t60 = clamp(4.2 - Math.log2(freq / 110) * 0.9, 0.9, 4.5);
+  const dur = Math.min(t60 + 0.3, 5);
+  const n = (dur * sr) | 0;
+  const buf = actx.createBuffer(1, n, sr);
+  const d = buf.getChannelData(0);
+  const N = Math.max(2, Math.round(sr / freq));
+  // excitation: filtered noise, brighter for harder plucks
+  const bright = 0.25 + 0.7 * amp;
+  let lp = 0, mean = 0;
+  const ex = new Float32Array(N);
+  for (let i = 0; i < N; i++) { lp += bright * ((Math.random() * 2 - 1) - lp); ex[i] = lp; }
+  // pick position comb filter (where along the string it was plucked)
+  const off = Math.max(1, Math.round(clamp(pickPos, 0.08, 0.5) * N));
+  for (let i = 0; i < N; i++) { d[i] = ex[i] - 0.8 * ex[(i + off) % N]; mean += d[i]; }
+  mean /= N;
+  for (let i = 0; i < N; i++) d[i] -= mean;
+  const gLoss = Math.pow(0.001, 1 / (freq * t60));
+  d[N] = gLoss * d[0];
+  for (let i = N + 1; i < n; i++) d[i] = gLoss * 0.5 * (d[i - N] + d[i - N - 1]);
+  const fade = (0.06 * sr) | 0;
+  for (let i = 0; i < fade; i++) d[n - 1 - i] *= i / fade;
+
+  const src = actx.createBufferSource(); src.buffer = buf;
+  const gain = actx.createGain(); gain.gain.value = 0.25 + 0.55 * amp;
+  const p = actx.createStereoPanner ? actx.createStereoPanner() : null;
+  src.connect(gain);
+  if (p) { p.pan.value = clamp(pan, -1, 1); gain.connect(p); p.connect(master); } else gain.connect(master);
+  src.start();
+}
+
+// ---------- Strings ----------
+const strings = [];
+const particles = [];
+let nextId = 1;
+function addString(a, b) {
+  const s = { id: nextId++, a: { ...a }, b: { ...b }, len: dist(a, b),
+    A: 0, t0: 0, grab: null, lastHit: {}, pulses: [], born: performance.now() };
+  strings.push(s);
+  if (strings.length > 24) strings.shift();
+  pluck(s, 0.5, 0.35, 12);
+}
+function geom(s) {
+  const dx = s.b.x - s.a.x, dy = s.b.y - s.a.y, L = Math.hypot(dx, dy) || 1;
+  return { dx, dy, L, nx: -dy / L, ny: dx / L };
+}
+function pluck(s, amp, t, visualAmp, sign) {
+  const now = performance.now();
+  const m = stringMidi(s);
+  const mid = lerpPt(s.a, s.b, 0.5);
+  playPluck(midiToFreq(m), amp, (mid.x / W) * 2 - 1, Math.min(t, 1 - t));
+  s.A = (visualAmp ?? amp * 24) * (sign ?? (Math.random() < 0.5 ? -1 : 1));
+  s.t0 = now;
+  const p = lerpPt(s.a, s.b, t);
+  s.pulses.push({ t, dir: 1, born: now }, { t, dir: -1, born: now });
+  const { dx, dy, L } = geom(s);
+  const hue = hueFor(m);
+  for (let i = 0; i < 10 + amp * 22; i++) {
+    const along = (Math.random() * 2 - 1) * (2 + amp * 5);
+    const perp = (Math.random() * 2 - 1) * 2.5;
+    particles.push({ x: p.x, y: p.y,
+      vx: dx / L * along * 60 + -dy / L * perp * 60, vy: dy / L * along * 60 + dx / L * perp * 60,
+      life: 1, decay: 0.9 + Math.random() * 1.4, hue });
+  }
+}
+function nearestString(p, maxD) {
+  let best = null;
+  for (const s of strings) {
+    const { dx, dy, L } = geom(s);
+    const t = clamp(((p.x - s.a.x) * dx + (p.y - s.a.y) * dy) / (L * L), 0.04, 0.96);
+    const q = lerpPt(s.a, s.b, t), d = dist(p, q);
+    if (d < maxD && (!best || d < best.d)) best = { s, t, d };
+  }
+  return best;
+}
+function grabState(s) { // signed displacement & position along string of the grab point
+  const { dx, dy, L, nx, ny } = geom(s);
+  const gp = s.grab.p.pos;
+  const tg = clamp(((gp.x - s.a.x) * dx + (gp.y - s.a.y) * dy) / (L * L), 0.03, 0.97);
+  const disp = (gp.x - s.a.x) * nx + (gp.y - s.a.y) * ny;
+  return { tg, disp };
+}
+function releaseString(s) {
+  if (!s.grab) return;
+  const { tg, disp } = grabState(s);
+  s.grab = null;
+  const amp = clamp(Math.abs(disp) / 90, 0.12, 1);
+  pluck(s, amp, tg, clamp(Math.abs(disp), 4, 120), Math.sign(disp) || 1);
+}
+// offset of the string at param u (0..1), in px along its normal
+function offsetAt(s, u, now) {
+  if (s.grab) {
+    const { tg, disp } = grabState(s);
+    return u < tg ? disp * (u / tg) : disp * ((1 - u) / (1 - tg));
+  }
+  const el = (now - s.t0) / 1000;
+  const env = s.A * Math.exp(-el * 2.4);
+  if (Math.abs(env) < 0.05) return 0;
+  const m = stringMidi(s);
+  const w = 2 * Math.PI * clamp(7 + 3 * Math.log2(midiToFreq(m) / 110), 6, 18);
+  return env * (Math.sin(Math.PI * u) * Math.cos(w * el) + 0.25 * Math.sin(2 * Math.PI * u) * Math.cos(2 * w * el + 1));
+}
+
+// ---------- Pointers (hands + mouse/touch) ----------
+const pointers = new Map();
+function makePointer(id, isHand) {
+  return { id, isHand, pos: null, tip: null, prevTip: null, pinching: false, mode: null,
+    start: null, string: null, lastSeen: performance.now(), lms: null, ratio: 1 };
+}
+function pinchStart(p) {
+  const hit = nearestString(p.pos, p.isHand ? 38 : 22);
+  if (hit && !hit.s.grab) {
+    hit.s.grab = { p }; p.mode = 'grab'; p.string = hit.s;
+  } else {
+    p.mode = 'draw'; p.start = { ...p.pos };
+  }
+}
+function otherDrawingHand(p) {
+  if (!p.isHand) return null;
+  for (const q of pointers.values()) if (q !== p && q.isHand && q.mode === 'draw') return q;
+  return null;
+}
+function pinchEnd(p) {
+  if (p.mode === 'grab') releaseString(p.string);
+  else if (p.mode === 'draw') {
+    const other = otherDrawingHand(p);
+    let a, b;
+    if (other) { a = other.pos; b = p.pos; other.mode = 'consumed'; }
+    else { a = p.start; b = p.pos; }
+    if (dist(a, b) > 50) addString(a, b);
+  }
+  p.mode = null; p.string = null; p.start = null; p.prevTip = null;
+}
+function updatePointer(p, now) {
+  if (p.mode === 'grab' && p.string) {
+    const s = p.string;
+    if (!strings.includes(s)) { p.mode = 'consumed'; p.string = null; return; }
+    const { disp } = grabState(s);
+    if (Math.abs(disp) > Math.max(130, s.len * 0.45)) { // pulled too far: it snaps out of your fingers
+      releaseString(s); p.mode = 'consumed'; p.string = null;
+    }
+  }
+  if (!p.mode && !p.pinching && p.prevTip && p.tip) {
+    const speed = dist(p.prevTip, p.tip);
+    if (speed > 2) {
+      for (const s of strings) {
+        if (s.grab) continue;
+        const t = segInter(p.prevTip, p.tip, s.a, s.b);
+        if (t === null) continue;
+        if (now - (s.lastHit[p.id] || 0) < 160) continue;
+        s.lastHit[p.id] = now;
+        pluck(s, clamp(speed / 45, 0.2, 1), t);
+      }
+    }
+  }
+  if (p.tip) p.prevTip = { ...p.tip };
+}
+
+// Mouse / touch
+canvas.addEventListener('pointerdown', e => {
+  initAudio();
+  const id = 'ptr' + e.pointerId;
+  const p = pointers.get(id) || makePointer(id, false);
+  pointers.set(id, p);
+  p.pos = { x: e.clientX, y: e.clientY }; p.tip = { ...p.pos }; p.prevTip = null;
+  p.pinching = true; pinchStart(p);
+  canvas.setPointerCapture(e.pointerId);
+});
+canvas.addEventListener('pointermove', e => {
+  const id = 'ptr' + e.pointerId;
+  let p = pointers.get(id);
+  if (!p) { if (e.pointerType !== 'mouse') return; p = makePointer(id, false); pointers.set(id, p); }
+  p.pos = { x: e.clientX, y: e.clientY }; p.tip = { ...p.pos };
+});
+const endPtr = e => {
+  const id = 'ptr' + e.pointerId, p = pointers.get(id);
+  if (!p) return;
+  if (p.pinching) { p.pinching = false; pinchEnd(p); }
+  if (e.pointerType !== 'mouse') pointers.delete(id);
+};
+canvas.addEventListener('pointerup', endPtr);
+canvas.addEventListener('pointercancel', endPtr);
+canvas.addEventListener('pointerleave', e => { if (e.pointerType === 'mouse' && !pointers.get('ptr' + e.pointerId)?.pinching) pointers.delete('ptr' + e.pointerId); });
+
+// ---------- Hand tracking ----------
+let landmarker = null, lastVideoTime = -1, camOn = false;
+let showVideo = true, showHands = true;
+const CONN = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],
+  [9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+
+function cover() {
+  const vw = video.videoWidth || 1280, vh = video.videoHeight || 720;
+  const s = Math.max(W / vw, H / vh), dw = vw * s, dh = vh * s;
+  return { dw, dh, ox: (W - dw) / 2, oy: (H - dh) / 2 };
+}
+async function startCamera() {
+  statusEl.style.display = 'block';
+  statusEl.textContent = 'Requesting camera…';
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' }, audio: false });
+    video.srcObject = stream;
+    await video.play();
+    camOn = true;
+  } catch (err) {
+    statusEl.textContent = 'No camera access. Mouse mode only (' + (err.name || err) + ')';
+    return;
+  }
+  statusEl.textContent = 'Loading hand model…';
+  try {
+    const fileset = await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
+    const opts = (delegate) => ({
+      baseOptions: { modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task', delegate },
+      runningMode: 'VIDEO', numHands: 2,
+      minHandDetectionConfidence: 0.5, minHandPresenceConfidence: 0.5, minTrackingConfidence: 0.5,
+    });
+    try { landmarker = await HandLandmarker.createFromOptions(fileset, opts('GPU')); }
+    catch { landmarker = await HandLandmarker.createFromOptions(fileset, opts('CPU')); }
+    statusEl.textContent = 'Show your hands';
+  } catch (err) {
+    console.error(err);
+    statusEl.textContent = 'Hand model failed to load. Mouse mode only.';
+  }
+}
+function detectHands(now) {
+  if (!landmarker || !camOn || video.readyState < 2 || video.currentTime === lastVideoTime) return;
+  lastVideoTime = video.currentTime;
+  const res = landmarker.detectForVideo(video, now);
+  const r = cover();
+  const seen = new Set();
+  (res.landmarks || []).forEach((lm, i) => {
+    let key = 'hand-' + (res.handedness?.[i]?.[0]?.categoryName || i);
+    if (seen.has(key)) key += i;
+    seen.add(key);
+    const pts = lm.map(l => ({ x: W - (r.ox + l.x * r.dw), y: r.oy + l.y * r.dh }));
+    let p = pointers.get(key);
+    if (!p) { p = makePointer(key, true); pointers.set(key, p); }
+    p.lms = pts; p.lastSeen = now;
+    p.pos = smooth(p.pos, lerpPt(pts[4], pts[8], 0.5), 0.6);
+    p.tip = smooth(p.tip, pts[8], 0.7);
+    const size = dist(pts[0], pts[9]) || 1;
+    p.ratio = dist(pts[4], pts[8]) / size;
+    if (!p.pinching && p.ratio < 0.25) { p.pinching = true; pinchStart(p); }
+    else if (p.pinching && p.ratio > 0.42) { p.pinching = false; pinchEnd(p); }
+  });
+  const n = seen.size;
+  statusEl.textContent = n === 0 ? 'Show your hands' : n === 1 ? '1 hand' : '2 hands';
+}
+function dropStaleHands(now) {
+  for (const [k, p] of pointers) {
+    if (p.isHand && now - p.lastSeen > 300) {
+      if (p.pinching) { p.pinching = false; pinchEnd(p); }
+      pointers.delete(k);
+    }
+  }
+}
+
+// ---------- Rendering ----------
+function drawStringPath(s, now) {
+  const { dx, dy, L, nx, ny } = geom(s);
+  const N = Math.max(16, Math.min(80, Math.round(L / 10)));
+  const pts = [];
+  for (let i = 0; i <= N; i++) {
+    const u = i / N, o = offsetAt(s, u, now);
+    pts.push({ x: s.a.x + dx * u + nx * o, y: s.a.y + dy * u + ny * o });
+  }
+  return pts;
+}
+function strokePts(pts) {
+  g.beginPath(); g.moveTo(pts[0].x, pts[0].y);
+  for (let i = 1; i < pts.length; i++) g.lineTo(pts[i].x, pts[i].y);
+  g.stroke();
+}
+function drawString(s, now) {
+  const m = stringMidi(s), hue = hueFor(m);
+  const pts = drawStringPath(s, now);
+  const energy = s.grab ? 1 : clamp(Math.abs(s.A) * Math.exp(-(now - s.t0) / 1000 * 2.4) / 20, 0, 1);
+  const birth = clamp((now - s.born) / 250, 0, 1);
+  g.lineCap = 'round'; g.lineJoin = 'round';
+  g.strokeStyle = `hsla(${hue},100%,60%,${(0.12 + 0.25 * energy) * birth})`; g.lineWidth = 10 + 8 * energy; strokePts(pts);
+  g.strokeStyle = `hsla(${hue},100%,70%,${(0.35 + 0.3 * energy) * birth})`; g.lineWidth = 3.5; strokePts(pts);
+  g.strokeStyle = `hsla(${hue},100%,94%,${0.95 * birth})`; g.lineWidth = 1.4; strokePts(pts);
+
+  // tick marks along the string
+  const { nx, ny, L } = geom(s);
+  const step = Math.max(2, Math.round(pts.length / (L / 16)));
+  g.strokeStyle = `hsla(${hue},80%,90%,${0.55 * birth})`; g.lineWidth = 1;
+  g.beginPath();
+  for (let i = step; i < pts.length - 1; i += step) {
+    const p = pts[i];
+    g.moveTo(p.x, p.y); g.lineTo(p.x + nx * 5, p.y + ny * 5);
+  }
+  g.stroke();
+
+  // end caps
+  for (const e of [s.a, s.b]) {
+    g.fillStyle = `hsla(${hue},100%,92%,${birth})`;
+    g.beginPath(); g.arc(e.x, e.y, 3, 0, Math.PI * 2); g.fill();
+    g.strokeStyle = `hsla(${hue},100%,75%,${0.6 * birth})`; g.lineWidth = 1.2;
+    g.beginPath(); g.arc(e.x, e.y, 7, 0, Math.PI * 2); g.stroke();
+  }
+
+  // travelling light pulses
+  s.pulses = s.pulses.filter(p => {
+    const age = (now - p.born) / 1000;
+    const u = p.t + p.dir * age * 1.6;
+    if (u < 0 || u > 1 || age > 1) return false;
+    const idx = clamp(Math.round(u * (pts.length - 1)), 0, pts.length - 1);
+    const q = pts[idx], a = 1 - age;
+    const grd = g.createRadialGradient(q.x, q.y, 0, q.x, q.y, 16);
+    grd.addColorStop(0, `hsla(${hue},100%,95%,${a})`);
+    grd.addColorStop(1, `hsla(${hue},100%,60%,0)`);
+    g.fillStyle = grd; g.beginPath(); g.arc(q.x, q.y, 16, 0, Math.PI * 2); g.fill();
+    return true;
+  });
+
+  // note label
+  const mid = pts[Math.floor(pts.length / 2)];
+  g.font = '600 11px ui-sans-serif, system-ui, sans-serif';
+  g.fillStyle = `hsla(${hue},70%,88%,${0.75 * birth})`;
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.fillText(noteName(m), mid.x - nx * 16, mid.y - ny * 16);
+}
+function drawPreview(a, b) {
+  const len = dist(a, b);
+  const m = quantize(rawMidi(len)), hue = hueFor(m);
+  g.setLineDash([6, 6]);
+  g.strokeStyle = `hsla(${hue},100%,80%,0.8)`; g.lineWidth = 1.5;
+  g.beginPath(); g.moveTo(a.x, a.y); g.lineTo(b.x, b.y); g.stroke();
+  g.setLineDash([]);
+  for (const e of [a, b]) {
+    g.fillStyle = `hsla(${hue},100%,90%,0.9)`;
+    g.beginPath(); g.arc(e.x, e.y, 4, 0, Math.PI * 2); g.fill();
+  }
+  if (len > 50) {
+    const mid = lerpPt(a, b, 0.5);
+    g.font = '600 12px ui-sans-serif, system-ui, sans-serif';
+    g.fillStyle = `hsla(${hue},80%,90%,0.9)`; g.textAlign = 'center'; g.textBaseline = 'bottom';
+    g.fillText(noteName(m), mid.x, mid.y - 8);
+  }
+}
+function drawHand(p) {
+  const pts = p.lms;
+  g.strokeStyle = 'rgba(70,255,120,0.9)'; g.lineWidth = 2.5;
+  g.beginPath();
+  for (const [i, j] of CONN) { g.moveTo(pts[i].x, pts[i].y); g.lineTo(pts[j].x, pts[j].y); }
+  g.stroke();
+  g.fillStyle = 'rgba(230,20,40,0.95)';
+  for (const q of pts) { g.beginPath(); g.arc(q.x, q.y, 3.6, 0, Math.PI * 2); g.fill(); }
+}
+function drawCursor(p) {
+  if (!p.pos) return;
+  const closeness = clamp(1 - (p.ratio - 0.25) / 0.6, 0, 1);
+  const r = p.pinching ? 7 : 9 + (1 - closeness) * 10;
+  g.strokeStyle = p.pinching ? 'rgba(255,240,180,0.95)' : `rgba(255,255,255,${0.25 + 0.5 * closeness})`;
+  g.lineWidth = 1.5;
+  g.beginPath(); g.arc(p.pos.x, p.pos.y, r, 0, Math.PI * 2); g.stroke();
+  if (p.pinching) { g.fillStyle = 'rgba(255,240,180,0.9)'; g.beginPath(); g.arc(p.pos.x, p.pos.y, 3, 0, Math.PI * 2); g.fill(); }
+}
+
+let lastFrame = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - lastFrame) / 1000); lastFrame = now;
+  detectHands(now);
+  dropStaleHands(now);
+  for (const p of pointers.values()) updatePointer(p, now);
+
+  // background
+  g.globalCompositeOperation = 'source-over';
+  g.fillStyle = '#05070c'; g.fillRect(0, 0, W, H);
+  if (camOn && showVideo && video.readyState >= 2) {
+    const r = cover();
+    g.save(); g.translate(W, 0); g.scale(-1, 1);
+    g.globalAlpha = 0.55; g.drawImage(video, r.ox, r.oy, r.dw, r.dh);
+    g.restore(); g.globalAlpha = 1;
+  }
+
+  if (showHands) for (const p of pointers.values()) if (p.isHand && p.lms) drawHand(p);
+
+  g.globalCompositeOperation = 'lighter';
+  for (const s of strings) drawString(s, now);
+
+  // particles
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const q = particles[i];
+    q.x += q.vx * dt; q.y += q.vy * dt; q.vx *= 0.96; q.vy = q.vy * 0.96 + 30 * dt;
+    q.life -= q.decay * dt;
+    if (q.life <= 0) { particles.splice(i, 1); continue; }
+    g.strokeStyle = `hsla(${q.hue},100%,85%,${q.life})`; g.lineWidth = 1.5;
+    g.beginPath(); g.moveTo(q.x, q.y); g.lineTo(q.x - q.vx * 0.03, q.y - q.vy * 0.03); g.stroke();
+  }
+
+  // previews of strings being drawn
+  const drawn = new Set();
+  for (const p of pointers.values()) {
+    if (p.mode !== 'draw' || drawn.has(p)) continue;
+    const other = otherDrawingHand(p);
+    if (other) { drawPreview(other.pos, p.pos); drawn.add(other); }
+    else drawPreview(p.start, p.pos);
+    drawn.add(p);
+  }
+  g.globalCompositeOperation = 'source-over';
+  for (const p of pointers.values()) if (p.isHand) drawCursor(p);
+
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// ---------- UI ----------
+const intro = document.getElementById('intro'), bar = document.getElementById('bar');
+function begin(withCam) {
+  initAudio();
+  intro.style.display = 'none';
+  bar.style.display = 'flex';
+  if (withCam) startCamera();
+  else { statusEl.style.display = 'block'; statusEl.textContent = 'Mouse mode: drag to draw a string'; document.getElementById('toggleVideo').style.display = 'none'; }
+}
+document.getElementById('start').onclick = () => begin(true);
+document.getElementById('mouseOnly').onclick = () => begin(false);
+const undo = () => { const s = strings.pop(); if (s?.grab) s.grab.p.mode = 'consumed'; };
+const clearAll = () => { while (strings.length) undo(); };
+document.getElementById('undo').onclick = undo;
+document.getElementById('clear').onclick = clearAll;
+document.getElementById('scale').onchange = e => { scaleName = e.target.value; };
+const tv = document.getElementById('toggleVideo'), th = document.getElementById('toggleHands');
+const toggleVideo = () => { showVideo = !showVideo; tv.textContent = showVideo ? 'Hide camera' : 'Show camera'; };
+const toggleHands = () => { showHands = !showHands; th.textContent = showHands ? 'Hide hands' : 'Show hands'; };
+tv.onclick = toggleVideo; th.onclick = toggleHands;
+addEventListener('keydown', e => {
+  if (e.target.tagName === 'SELECT') return;
+  if (e.key === 'Backspace' || e.key === 'z') undo();
+  else if (e.key === 'c') clearAll();
+  else if (e.key === 'v') toggleVideo();
+  else if (e.key === 'h') toggleHands();
+});
+</script>
+</body>
+</html>

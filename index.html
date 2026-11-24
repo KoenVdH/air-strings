@@ -72,6 +72,7 @@
       <li>Or pinch with <b>both hands</b> to stretch a string between them.</li>
       <li><b>Swipe</b> your index fingertip through a string to pluck it.</li>
       <li><b>Pinch on a string</b> to grab it, pull it, and let go to twang it.</li>
+      <li><b>Pinch an end point</b> and drag it to make the string longer or shorter.</li>
     </ol>
     <p class="sub">Shorter strings play higher notes. A mouse also works: drag to draw, hover across a string to pluck it, drag a string to pull it.</p>
     <div class="row">
@@ -274,9 +275,23 @@ function makePointer(id, isHand) {
   return { id, isHand, pos: null, tip: null, prevTip: null, pinching: false, mode: null,
     start: null, string: null, lastSeen: performance.now(), lms: null, ratio: 1 };
 }
+function nearestEnd(p, maxD) {
+  let best = null;
+  for (const s of strings) for (const which of ['a', 'b']) {
+    const d = dist(p, s[which]);
+    if (d < maxD && (!best || d < best.d)) best = { s, which, d };
+  }
+  return best;
+}
 function pinchStart(p) {
+  const end = nearestEnd(p.pos, p.isHand ? 34 : 18);
+  if (end && !end.s.grab && !end.s.drag) {
+    end.s.drag = { p, which: end.which }; p.mode = 'end'; p.string = end.s;
+    p.lastNote = Math.round(stringMidi(end.s));
+    return;
+  }
   const hit = nearestString(p.pos, p.isHand ? 38 : 22);
-  if (hit && !hit.s.grab) {
+  if (hit && !hit.s.grab && !hit.s.drag) {
     hit.s.grab = { p }; p.mode = 'grab'; p.string = hit.s;
   } else {
     p.mode = 'draw'; p.start = { ...p.pos };
@@ -289,6 +304,10 @@ function otherDrawingHand(p) {
 }
 function pinchEnd(p) {
   if (p.mode === 'grab') releaseString(p.string);
+  else if (p.mode === 'end' && p.string) {
+    p.string.drag = null;
+    if (strings.includes(p.string)) pluck(p.string, 0.5, 0.35, 12);
+  }
   else if (p.mode === 'draw') {
     const other = otherDrawingHand(p);
     let a, b;
@@ -299,6 +318,19 @@ function pinchEnd(p) {
   p.mode = null; p.string = null; p.start = null; p.prevTip = null;
 }
 function updatePointer(p, now) {
+  if (p.mode === 'end' && p.string) {
+    const s = p.string, w = s.drag.which, other = w === 'a' ? s.b : s.a;
+    if (!strings.includes(s)) { p.mode = 'consumed'; p.string = null; return; }
+    if (dist(p.pos, other) >= 40) {
+      s[w] = { ...p.pos }; s.len = dist(s.a, s.b);
+      const note = Math.round(stringMidi(s));
+      if (note !== p.lastNote) { // tick through the notes as the string grows/shrinks
+        p.lastNote = note;
+        playPluck(midiToFreq(stringMidi(s)), 0.18, (s[w].x / W) * 2 - 1, 0.3);
+        s.A = 5; s.t0 = now;
+      }
+    }
+  }
   if (p.mode === 'grab' && p.string) {
     const s = p.string;
     if (!strings.includes(s)) { p.mode = 'consumed'; p.string = null; return; }
@@ -311,7 +343,7 @@ function updatePointer(p, now) {
     const speed = dist(p.prevTip, p.tip);
     if (speed > 2) {
       for (const s of strings) {
-        if (s.grab) continue;
+        if (s.grab || s.drag) continue;
         const t = segInter(p.prevTip, p.tip, s.a, s.b);
         if (t === null) continue;
         if (now - (s.lastHit[p.id] || 0) < 160) continue;
@@ -465,6 +497,11 @@ function drawString(s, now) {
     g.strokeStyle = `hsla(${hue},100%,75%,${0.6 * birth})`; g.lineWidth = 1.2;
     g.beginPath(); g.arc(e.x, e.y, 7, 0, Math.PI * 2); g.stroke();
   }
+  if (s.drag) { // highlight the end being dragged
+    const e = s[s.drag.which];
+    g.strokeStyle = `hsla(${hue},100%,85%,0.9)`; g.lineWidth = 2;
+    g.beginPath(); g.arc(e.x, e.y, 13, 0, Math.PI * 2); g.stroke();
+  }
 
   // travelling light pulses
   s.pulses = s.pulses.filter(p => {
@@ -583,7 +620,11 @@ function begin(withCam) {
 }
 document.getElementById('start').onclick = () => begin(true);
 document.getElementById('mouseOnly').onclick = () => begin(false);
-const undo = () => { const s = strings.pop(); if (s?.grab) s.grab.p.mode = 'consumed'; };
+const undo = () => {
+  const s = strings.pop();
+  if (s?.grab) s.grab.p.mode = 'consumed';
+  if (s?.drag) s.drag.p.mode = 'consumed';
+};
 const clearAll = () => { while (strings.length) undo(); };
 document.getElementById('undo').onclick = undo;
 document.getElementById('clear').onclick = clearAll;

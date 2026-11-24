@@ -7,5 +7,6 @@ Draw strings of light in midair with your hands and play them. Uses your webcam 
 - Pinch thumb + index, move, release: creates a string (or pinch with both hands)
 - Swipe your index fingertip through a string to pluck it
 - Pinch on a string to grab it, pull, and let go
+- Pinch an end point and drag it to extend or shorten the string
 
 Shorter strings play higher notes.
